@@ -6,6 +6,7 @@ on every record. Exit code 1 if any record has status 'error'.
 """
 
 import json
+import math
 import re
 import sys
 from collections import Counter
@@ -37,8 +38,11 @@ def check_record(rec: dict) -> tuple[list[str], list[str]]:
 
     if not NOTICE_ID.match(str(rec.get("notice_id", ""))):
         errors.append("invalid notice_id")
-    if not str(rec.get("source_url") or "").startswith("https://ted.europa.eu/"):
+    url = str(rec.get("source_url") or "")
+    if not url.startswith("https://ted.europa.eu/"):
         errors.append("missing or non-TED source_url")
+    elif f"/{rec.get('notice_id')}/" not in url:
+        errors.append("source_url points to a different notice")
     if not _is_iso_date(rec.get("publication_date")):
         errors.append("publication_date is not an ISO date (YYYY-MM-DD)")
     if not _is_utc_timestamp(rec.get("fetched_at_utc")):
@@ -51,15 +55,15 @@ def check_record(rec: dict) -> tuple[list[str], list[str]]:
         if not rec.get("needs_manual_review"):
             errors.append("amount is null but record is not flagged for review")
     else:
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount <= 0:
-            errors.append(f"amount must be > 0 or null, got {amount!r}")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not 0 < amount < math.inf:
+            errors.append(f"amount must be a finite number > 0 or null, got {amount!r}")
         if currency not in ISO_CURRENCIES:
             errors.append(f"invalid currency {currency!r}")
 
-    # Framework agreements: the published value is a ceiling, not actual spending.
-    if rec.get("is_framework_ceiling"):
-        if not (rec.get("is_framework_agreement") and amount is not None):
-            errors.append("is_framework_ceiling set but no framework agreement with amount")
+    # Framework maximum: the published value is a ceiling, not actual spending.
+    if bool(rec.get("is_framework_ceiling")) != (rec.get("amount_kind") == "framework_maximum" and amount is not None):
+        errors.append("is_framework_ceiling does not match amount_kind")
+    elif rec.get("is_framework_ceiling"):
         warnings.append("amount is a framework ceiling, not realised spending")
 
     if rec.get("needs_manual_review"):

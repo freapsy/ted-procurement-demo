@@ -37,22 +37,26 @@ def _utc_now() -> str:
 
 def fetch_live(limit: int) -> None:
     """Store the untouched API response and notice pages, plus when/where they came from."""
-    (RAW / "html").mkdir(parents=True, exist_ok=True)
     searches = []
     for query in (ted_api.DEFAULT_QUERY, ted_api.EDGE_CASE_QUERY):
         searches.append({"fetched_at_utc": _utc_now(), "endpoint": ted_api.SEARCH_URL,
                          "query": query, "response": ted_api.search_notices(query, limit)})
-    (RAW / "search_response.json").write_text(json.dumps(searches, indent=2, ensure_ascii=False))
 
-    manifest = {}
+    manifest, pages = {}, {}
     for notice in _notices(searches):
         nid = notice["publication-number"]
         path = RAW / "html" / f"{nid}.html"
         url = ted_api.NOTICE_HTML_URL.format(notice_id=nid)
         manifest[nid] = {"source_url": url, "fetched_at_utc": _utc_now(),
                          "raw_html_path": str(path.relative_to(DATA.parent))}
-        path.write_text(ted_api.fetch_notice_html(nid), encoding="utf-8")
+        pages[path] = ted_api.fetch_notice_html(nid)
         time.sleep(2)  # be polite: TED rate-limits fast clients (HTTP 429)
+
+    # Write only after every download succeeded, so a failed run leaves the old snapshot intact.
+    (RAW / "html").mkdir(parents=True, exist_ok=True)
+    for path, html in pages.items():
+        path.write_text(html, encoding="utf-8")
+    (RAW / "search_response.json").write_text(json.dumps(searches, indent=2, ensure_ascii=False))
     (RAW / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
@@ -73,8 +77,9 @@ def build_record(notice: dict, prov: dict, text: str, ext: dict, method: str) ->
         ext["review_reason"] = "; ".join(filter(None, [ext["review_reason"], "API flags framework, text does not"]))
 
     fa, amount = ext["is_framework_agreement"], ext["amount_value"]
-    # Is the amount a framework ceiling (not real spending)? None = can't tell yet.
-    ceiling = False if amount is None else fa
+    # A ceiling only if the amount came from a "Maximum value of the framework ..." field;
+    # a framework's awarded value (e.g. its approximate volume) is not its ceiling.
+    ceiling = ext["amount_kind"] == "framework_maximum"
     return {
         "notice_id": notice["publication-number"],
         **prov,

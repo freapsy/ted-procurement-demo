@@ -4,9 +4,9 @@ Two interchangeable extractors fill the same schema:
   * extract_rules(text) - deterministic regex fallback, no API key, used by default
   * extract_llm(text)   - Claude with structured outputs (needs ANTHROPIC_API_KEY)
 
-Both outputs go through check_schema() and apply_guards(), so an LLM answer is
-treated like any other untrusted input. Rule: never guess - a missing or
-ambiguous value becomes null + needs_manual_review=True with a reason.
+Both outputs go through apply_guards(); an LLM answer additionally has to pass
+check_schema() and verify_evidence() (quote must be verbatim in the source).
+Rule: never guess - a missing or ambiguous value becomes null + needs_manual_review=True with a reason.
 """
 
 import json
@@ -81,17 +81,48 @@ def apply_guards(out: dict) -> dict:
             _review(out, "no amount found")
     if out["is_framework_agreement"] is None and "framework" not in (out["review_reason"] or ""):
         _review(out, "framework status unclear")
+    required = ["title", "buyer"] + (["currency", "amount_kind"] if out["amount_value"] is not None else [])
+    missing = [k for k in required if out[k] is None]
+    if missing:
+        _review(out, "missing " + ", ".join(missing))
     return out
+
+
+def verify_evidence(out: dict, text: str) -> dict:
+    """For LLM output: the quote must be verbatim in the notice and must state the amount.
+
+    Unverifiable values are kept but flagged, so they can never end up as 'ok'.
+    """
+    if out["evidence"] not in text:
+        _review(out, "evidence quote not found in notice text")
+    elif out["amount_value"] is not None:
+        labels = [label for kind, label, _ in _AMOUNT_LABELS if kind == out["amount_kind"]]
+        stated = [m for label in labels for m in re.finditer(label + _AMOUNT, out["evidence"])]
+        if not any(_parse_number(m.group(1)) == out["amount_value"] and m.group(2) == out["currency"]
+                   for m in stated):
+            _review(out, "evidence does not state this amount, currency and amount_kind")
+    return out
+
+
+def check_llm_output(data: dict, text: str) -> dict:
+    """Everything an LLM answer must pass before it is used (testable without an API call)."""
+    errors = check_schema(data)
+    if errors:
+        raise ValueError(f"LLM output violates schema: {errors}")
+    return apply_guards(verify_evidence(data, text))
 
 
 # ---------------------------------------------------------------- rules ----
 
 _AMOUNT = r"(\d[\d .\u00a0]*,\d{2}) ([A-Z]{3})"  # EU number format, same line only
-# Order matters: an awarded value is better evidence than an estimate.
+# (kind, label, scope). Order matters: an awarded value is better evidence than an estimate.
+# Scope "procedure" = text before the first "Lot:" section, so a single lot's value is
+# never reported as the notice total. "... in this notice" labels are notice-level wherever they are.
 _AMOUNT_LABELS = [
-    ("awarded", r"Value of all contracts awarded in this notice: "),
-    ("framework_maximum", r"Maximum value of the framework agreements?(?: in this notice)?: "),
-    ("estimated", r"Estimated value excluding VAT: "),
+    ("awarded", r"Value of all contracts awarded in this notice: ", "notice"),
+    ("framework_maximum", r"Maximum value of the framework agreements in this notice: ", "notice"),
+    ("framework_maximum", r"Maximum value of the framework agreement: ", "procedure"),
+    ("estimated", r"Estimated value excluding VAT: ", "procedure"),
 ]
 _FRAMEWORK_WORDS = r"Rahmenvereinbarung|Rahmenvertrag|framework agreement|^RV\b"
 
@@ -115,14 +146,18 @@ def extract_rules(text: str) -> dict:
         "review_reason": None, "evidence": "",
     }
 
-    for kind, label in _AMOUNT_LABELS:
-        m = re.search(label + _AMOUNT, text)
+    procedure = re.split(r"^Lot: ", text, maxsplit=1, flags=re.MULTILINE)[0]
+    for kind, label, scope in _AMOUNT_LABELS:
+        part = text if scope == "notice" else procedure
+        m = re.search(label + _AMOUNT, part)
         if m:
             out.update(amount_value=_parse_number(m.group(1)), currency=m.group(2), amount_kind=kind)
             out["evidence"] = m.group(0)
             break
-        if re.search(label + "unpublished", text):
+        m = re.search(label + "unpublished", part)
+        if m:
             _review(out, f"{kind} value marked 'unpublished'")
+            out["evidence"] = out["evidence"] or m.group(0)
 
     # Structured field ("Framework agreement: ...") vs. free-text signals.
     techniques = re.findall(r"Framework agreement: (No framework agreement|Framework agreement[^\n]*)", text)
@@ -151,7 +186,9 @@ Rules:
 - is_framework_agreement: true/false only if the text states it; if the
   structured field and the description contradict each other, use null.
 - If anything is null or ambiguous, set needs_manual_review=true and explain in
-  review_reason. evidence: a short verbatim quote supporting the amount.
+  review_reason. evidence: the verbatim line with the amount, including its
+  label (e.g. "Value of all contracts awarded in this notice: 138 100,00 EUR").
+- Use only notice-level values, never the value of a single lot.
 
 Notice text:
 """
@@ -173,7 +210,4 @@ def extract_llm(text: str) -> dict:
     if response.stop_reason != "end_turn":
         raise RuntimeError(f"LLM extraction stopped: {response.stop_reason}")
     data = json.loads(next(b.text for b in response.content if b.type == "text"))
-    errors = check_schema(data)
-    if errors:
-        raise ValueError(f"LLM output violates schema: {errors}")
-    return apply_guards(data)
+    return check_llm_output(data, text)

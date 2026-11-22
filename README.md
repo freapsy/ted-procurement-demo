@@ -3,7 +3,7 @@
 **A compact demonstration project**, not a research dataset. It shows, end to end and
 with real public data, how I would collect defence procurement notices, turn
 unstructured notice text into a fixed schema, keep a source trail for every value, and
-flag what a human has to check. About 500 lines of Python plus 120 lines of tests.
+flag what a human has to check. About 570 lines of Python plus 160 lines of tests.
 
 ```
 TED Search API (JSON) ──► notice HTML pages ──► plain text ──► extractor ──► guards ──► validate ──► CSV / JSON
@@ -24,7 +24,7 @@ offline, without an API key. Other modes:
 | `python3 run_demo.py --live` | re-fetches the notices from TED into `data/raw/` (network, ~30 s) |
 | `python3 run_demo.py --llm` | extracts with Claude instead of regex rules (`pip install anthropic`, `ANTHROPIC_API_KEY`) → `data/llm_output.*` |
 | `python3 validate.py data/sample_output.json` | runs the plausibility checks only |
-| `pip install pytest && python3 -m pytest` | 25 tests, all on the stored real notices |
+| `pip install pytest && python3 -m pytest` | 31 tests, almost all on stored real notices |
 
 ## Data source
 
@@ -47,7 +47,7 @@ offline, without an API key. Other modes:
 | `raw_text_excerpt` | verbatim text the amount / framework status was taken from |
 | `publication_date`, `country` | from the structured API response |
 | `buyer`, `title`, `amount_value`, `currency`, `amount_kind` | extracted from the notice text; `amount_kind` ∈ awarded / framework_maximum / estimated |
-| `is_framework_agreement`, `is_framework_ceiling` | `is_framework_ceiling = true` means the amount is a maximum, **not** realised spending |
+| `is_framework_agreement`, `is_framework_ceiling` | `is_framework_ceiling = true` only if the amount comes from a "Maximum value of the framework …" field: a maximum, **not** realised spending |
 | `needs_manual_review`, `review_reason` | set instead of guessing whenever a value is missing, a placeholder, or contradictory |
 | `extraction_method` | `rules` or `llm:<model>` |
 | `validation_status`, `validation_notes` | `ok` / `needs_review` / `error` from `validate.py` |
@@ -65,8 +65,9 @@ offline, without an API key. Other modes:
 | 672950-2026 | Herstellung von Basishelikoptern nebst Ausrüs… | 150,000,000 EUR | True | needs_review |
 | 785099-2026 | RV IRIS Radar System mit Zubehör | null | null | needs_review |
 
-Only 2 of 13 notices give an unambiguous contract value. Most German defence notices
-publish no value, or mark it "unpublished". That is the main finding of this small sample.
+In this sample of 13 notices, 2 give an awarded value, 2 a framework ceiling, and 9 no
+usable value (field missing, marked "unpublished", or a 1,00 EUR placeholder). The sample is
+far too small to say how common this is on TED in general.
 
 ## A checked edge case: notice 785099-2026
 
@@ -74,7 +75,8 @@ The [notice](https://ted.europa.eu/en/notice/785099-2026/html) (Bavarian police,
 
 * the title starts with **"RV"** (*Rahmenvertrag*) and the description says
   *"Vergabe einer Rahmenvereinbarung"*, but the structured field says **"No framework agreement"**;
-* every value field (estimated, tender, awarded) reads **1,00 EUR**, a placeholder for "not disclosed".
+* every value field (estimated, tender, awarded) reads **1,00 EUR**. I treat this as a placeholder
+  for "not disclosed". That is a heuristic: every amount ≤ 1 is set to null and flagged.
 
 A naive scraper would record a 1 EUR non-framework contract. The pipeline outputs:
 
@@ -96,13 +98,20 @@ I checked this by hand against the notice page. It is covered by
   * `extract_rules`: regex on the TED labels, deterministic, the default;
   * `extract_llm`: Claude (`claude-opus-5-5`) with **structured outputs** constrained to
     the same schema. The prompt says to copy values, never infer them, and to use null otherwise.
-* Both outputs then go through the same checks. The LLM answer is treated as untrusted input:
-  * `check_schema()` validates types, required fields and enums;
-  * `apply_guards()` turns amounts ≤ 1 into null and flags every null or unclear field for review.
+* Only notice-level amounts are used: the "… in this notice" result fields, or the value fields
+  before the first `Lot:` section. A single lot's value is never reported as the notice total.
+* Both outputs go through `apply_guards()`: amounts ≤ 1 become null, and a missing amount, title,
+  buyer, currency or amount kind, or an unclear framework status, is flagged for review.
+* The LLM answer is treated as untrusted input and must also pass:
+  * `check_schema()`: types, required fields and enums;
+  * `verify_evidence()`: the quote must appear verbatim in the notice text and state the same
+    amount, currency and amount kind. Otherwise the row is flagged, so it can never be `ok`.
 * `run_demo.py` cross-checks the API's structured framework flag against the extracted one.
-* `validate.py` checks the ISO currency, amount > 0 or explicit null (null must be flagged),
-  ISO dates, a UTC fetch timestamp, a TED source URL, duplicate `notice_id`s, and that a
-  framework ceiling is never reported as plain spending.
+* `is_framework_ceiling` follows the field the amount came from. A framework's awarded value
+  (e.g. notice 118509-2025: 25 M DKK awarded, 75 M DKK maximum) is not its ceiling.
+* `validate.py` checks the ISO currency, a finite amount > 0 or explicit null (null must be
+  flagged), ISO dates, a UTC fetch timestamp, a TED source URL that points to the same notice,
+  duplicate `notice_id`s, and that the ceiling flag matches the amount kind.
 
 ## Limitations & manual verification
 
@@ -112,7 +121,9 @@ I checked this by hand against the notice page. It is covered by
   reads the Search API and the HTML page, which keep label/value structure and avoid
   layout-dependent PDF text extraction. For PDF-only sources (e.g. national portals), the same
   `check_schema()` / `apply_guards()` step would run on the text after PDF text extraction.
-* **Values are notice-level.** Lot-level splits, options, VAT and currency conversion are not handled.
+* **Values are notice-level.** Lot values are deliberately ignored; lot splits, options, VAT and
+  currency conversion are not handled. For a framework, the awarded value is TED's stated
+  volume, not realised spending: call-offs are not published in these notices.
 * **Defence notices often hide values**, and contracts exempted under Art. 346 TFEU
   never appear on TED at all, so TED covers only part of military procurement.
 * **The LLM mode is optional and was not used for the stored sample.** Its output passes
@@ -129,6 +140,6 @@ extract.py       JSON schema, rule-based and Claude extractors, guards
 validate.py      plausibility checks (also a CLI)
 run_demo.py      pipeline: fetch (optional) -> extract -> validate -> CSV/JSON
 data/raw/        untouched API responses, notice HTML, manifest with fetch times
-tests/           pytest, runs on the stored real notices
+tests/           pytest, runs on the stored real notices (+ one extra real notice in tests/fixtures/)
 LICENSE          MIT
 ```

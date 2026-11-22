@@ -9,6 +9,7 @@ BASE = {
     "publication_date": "2026-11-17",
     "amount_value": 138100.0,
     "currency": "EUR",
+    "amount_kind": "awarded",
     "is_framework_agreement": False,
     "is_framework_ceiling": False,
     "needs_manual_review": False,
@@ -28,15 +29,18 @@ def test_clean_record_is_ok():
 @pytest.mark.parametrize("changes, message", [
     ({"currency": "EURO"}, "invalid currency"),
     ({"currency": None}, "invalid currency"),
-    ({"amount_value": 0}, "amount must be > 0"),
-    ({"amount_value": -5.0}, "amount must be > 0"),
+    ({"amount_value": 0}, "finite number > 0"),
+    ({"amount_value": -5.0}, "finite number > 0"),
     ({"amount_value": None}, "currency set without amount"),
     ({"amount_value": None, "currency": None}, "not flagged for review"),
     ({"publication_date": "17/11/2026"}, "not an ISO date"),
     ({"fetched_at_utc": "2026-11-22T13:56:40"}, "not an ISO UTC timestamp"),  # naive = no timezone
     ({"source_url": ""}, "source_url"),
+    ({"source_url": "https://ted.europa.eu/en/notice/672950-2026/html"}, "different notice"),
+    ({"amount_value": float("inf")}, "finite number"),
     ({"notice_id": "abc"}, "invalid notice_id"),
-    ({"is_framework_ceiling": True}, "no framework agreement with amount"),
+    ({"is_framework_ceiling": True}, "does not match amount_kind"),
+    ({"amount_kind": "framework_maximum"}, "does not match amount_kind"),
 ])
 def test_errors(changes, message):
     result, notes = status(**changes)
@@ -49,7 +53,7 @@ def test_null_amount_with_review_is_allowed():
 
 
 def test_framework_ceiling_is_flagged_not_rejected():
-    result, notes = status(is_framework_agreement=True, is_framework_ceiling=True)
+    result, notes = status(is_framework_agreement=True, is_framework_ceiling=True, amount_kind="framework_maximum")
     assert result == "needs_review" and "ceiling" in notes
 
 
